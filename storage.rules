@@ -1,0 +1,103 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function userDoc(uid) {
+      return firestore.get(/databases/(default)/documents/users/$(uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && userDoc(request.auth.uid).role == 'admin';
+    }
+
+    function isLandlordOrAgent() {
+      return isSignedIn() && userDoc(request.auth.uid).role in ['landlord', 'agent'];
+    }
+
+    function isReasonableImage() {
+      return request.resource.size < 8 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
+
+    function isReasonableVideo() {
+      return request.resource.size < 60 * 1024 * 1024
+        && request.resource.contentType.matches('video/.*');
+    }
+
+    // Property photos are publicly readable because approved listings expose
+    // them to prospective tenants. Writes are restricted to the property's
+    // owner/admin and only sane image files are accepted.
+    match /properties/{propertyId}/photos/{fileName} {
+      allow read: if true;
+      allow write: if isAdmin()
+        || (
+          isLandlordOrAgent()
+          && firestore.get(/databases/(default)/documents/properties/$(propertyId)).data.landlordId == request.auth.uid
+          && isReasonableImage()
+        );
+    }
+
+    // Maintenance media is private to the tenant, landlord/agent, or admin
+    // associated with the maintenance request.
+    match /maintenance/{maintenanceId}/photos/{fileName} {
+      allow read: if isAdmin()
+        || (
+          isSignedIn()
+          && (
+            firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.tenantId == request.auth.uid
+            || firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.landlordId == request.auth.uid
+          )
+        );
+      allow write: if isAdmin()
+        || (
+          isSignedIn()
+          && firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.tenantId == request.auth.uid
+          && isReasonableImage()
+        )
+        || (
+          isLandlordOrAgent()
+          && firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.landlordId == request.auth.uid
+          && isReasonableImage()
+        );
+    }
+
+    match /maintenance/{maintenanceId}/videos/{fileName} {
+      allow read: if isAdmin()
+        || (
+          isSignedIn()
+          && (
+            firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.tenantId == request.auth.uid
+            || firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.landlordId == request.auth.uid
+          )
+        );
+      allow write: if isAdmin()
+        || (
+          isSignedIn()
+          && firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.tenantId == request.auth.uid
+          && isReasonableVideo()
+        )
+        || (
+          isLandlordOrAgent()
+          && firestore.get(/databases/(default)/documents/maintenanceRequests/$(maintenanceId)).data.landlordId == request.auth.uid
+          && isReasonableVideo()
+        );
+    }
+
+    // Profile photos are readable by signed-in users but writable only by the
+    // owning account/admin.
+    match /users/{userId}/profile/{fileName} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin()
+        || (isSignedIn() && request.auth.uid == userId && isReasonableImage());
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

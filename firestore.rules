@@ -1,0 +1,671 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function myUid() {
+      return request.auth.uid;
+    }
+
+    function userDoc(uid) {
+      return get(/databases/$(database)/documents/users/$(uid)).data;
+    }
+
+    function myRole() {
+      return userDoc(myUid()).role;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && myRole() == 'admin';
+    }
+
+    function isLandlordOrAgent() {
+      return isSignedIn() && myRole() in ['landlord', 'agent'];
+    }
+
+    function isTenantRole() {
+      return isSignedIn() && myRole() == 'tenant';
+    }
+
+    function isNotSuspended() {
+      return userDoc(myUid()).isSuspended != true;
+    }
+
+    function docPath(collectionName, id) {
+      return /databases/$(database)/documents/$(collectionName)/$(id);
+    }
+
+    // One lock document per (tenant, property): at most one ACTIVE viewing request.
+    function viewingLockPath(tenantId, propertyId) {
+      return docPath('viewingLocks', tenantId + '_' + propertyId);
+    }
+
+    // Statuses a listing can only reach through admin approval ("live"). An owner may move
+    // between them (e.g. rented -> vacant when a tenant leaves) but can never ENTER them from
+    // pending / inactive / rejected, so the owner cannot skip review. Mirrors
+    // src/constants/propertyStatus.ts.
+    function isLiveStatus(status) {
+      return status in ['approved', 'vacant', 'rented', 'sold'];
+    }
+
+    // What a LANDLORD may do to a listing's status. Suspended listings are admin-only.
+    function landlordStatusChangeOk(oldStatus, newStatus) {
+      return (oldStatus == 'approved' && newStatus in ['approved', 'vacant', 'rented', 'sold', 'pending', 'inactive'])
+        || (oldStatus == 'vacant' && newStatus in ['vacant', 'rented', 'sold', 'pending', 'inactive'])
+        || (oldStatus == 'rented' && newStatus in ['rented', 'vacant', 'sold', 'pending', 'inactive'])
+        || (oldStatus == 'sold' && newStatus in ['sold', 'vacant', 'rented', 'pending', 'inactive'])
+        || (oldStatus == 'pending' && newStatus in ['pending', 'inactive'])
+        || (oldStatus == 'inactive' && newStatus in ['inactive', 'pending'])
+        || (oldStatus == 'rejected' && newStatus in ['rejected', 'pending', 'inactive']);
+    }
+
+
+    // ---------- users ----------
+    // Private profile documents are only directly readable by the owner/admin.
+    // The app only needs the current user's profile; counterpart display data
+    // should not expose another user's email/phone/FCM tokens.
+    match /users/{userId} {
+      allow get: if isAdmin() || (isSignedIn() && userId == myUid());
+      allow list: if isAdmin();
+
+      allow create: if isSignedIn()
+        && userId == myUid()
+        && request.resource.data.role in ['tenant', 'landlord']
+        && request.resource.data.isSuspended == false
+        && request.resource.data.firstName is string
+        && request.resource.data.lastName is string
+        && request.resource.data.email is string
+        && request.resource.data.email.size() <= 254
+        && (!('email' in request.auth.token)
+            || request.resource.data.email.lower() == request.auth.token.email.lower())
+        && request.resource.data.keys().hasOnly([
+          'role', 'firstName', 'lastName', 'email', 'phone', 'isSuspended',
+          'createdAt', 'updatedAt'
+        ]);
+
+      allow update: if isAdmin() || (
+        isSignedIn() && userId == myUid()
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.isSuspended == resource.data.isSuspended
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'firstName', 'lastName', 'phone', 'photoURL', 'city',
+          'fcmTokens', 'updatedAt'
+        ])
+      );
+
+      allow delete: if false;
+    }
+
+    // ---------- properties ----------
+    match /properties/{propertyId} {
+      // Public discovery is limited to approved listings. Owners/admins can
+      // read their own private/pending listings.
+      allow get: if resource.data.status in ['approved', 'vacant']
+        || (isSignedIn() && resource.data.landlordId == myUid())
+        || isAdmin();
+
+      // Firestore rules are not filters: the query must be provably limited to
+      // documents the caller may read. These conditions therefore mirror the
+      // supported client queries.
+      allow list: if isAdmin()
+        || resource.data.status in ['approved', 'vacant']
+        || (isLandlordOrAgent() && resource.data.landlordId == myUid());
+
+      allow create: if isLandlordOrAgent() && isNotSuspended()
+        && request.resource.data.landlordId == myUid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.isVerified == false
+        && request.resource.data.currency == 'ZMW'
+        && request.resource.data.get('photos', []) is list
+        && request.resource.data.get('photos', []).size() <= 30;
+
+      // Normal owner edits cannot change ownership, verification or counters.
+      allow update: if isAdmin()
+        || (
+          isLandlordOrAgent()
+          && resource.data.landlordId == myUid()
+          && request.resource.data.landlordId == resource.data.landlordId
+          && request.resource.data.isVerified == resource.data.isVerified
+          && request.resource.data.currency == 'ZMW'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'managedByAgentId', 'type', 'title', 'description', 'price',
+            'currency', 'rentFrequency', 'bedrooms', 'bathrooms',
+            'parkingSpaces', 'amenities', 'location', 'photos', 'status',
+            'updatedAt'
+          ])
+          && landlordStatusChangeOk(resource.data.status, request.resource.data.status)
+          // Once live, only price/frequency (and the status itself) may change. Any other
+          // content edit has to go back through review (-> pending) or off the market (-> inactive).
+          && (
+            !(isLiveStatus(resource.data.status) && isLiveStatus(request.resource.data.status))
+            || request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['status', 'price', 'rentFrequency', 'updatedAt'])
+          )
+          // MAX_PROPERTY_PHOTOS (src/constants/limits.ts)
+          && request.resource.data.get('photos', []).size() <= 30
+        )
+        // View counters are non-critical analytics. Keep the update narrowly
+        // scoped so a client cannot modify any other property field.
+        || (
+          isSignedIn()
+          && resource.data.status in ['approved', 'vacant']
+          && resource.data.landlordId != myUid()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['viewCount'])
+          && request.resource.data.viewCount == resource.data.viewCount + 1
+        )
+        // Favorites maintain a denormalized savedCount. The +/-1 is only allowed
+        // in the SAME atomic write that creates/deletes the caller's own favorite
+        // document, so the counter can't be inflated or deflated on its own.
+        || (
+          isSignedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['savedCount'])
+          && (
+            (
+              request.resource.data.savedCount == resource.data.savedCount + 1
+              && !exists(/databases/$(database)/documents/favorites/$(myUid() + '_' + propertyId))
+              && existsAfter(/databases/$(database)/documents/favorites/$(myUid() + '_' + propertyId))
+            )
+            || (
+              request.resource.data.savedCount == resource.data.savedCount - 1
+              && exists(/databases/$(database)/documents/favorites/$(myUid() + '_' + propertyId))
+              && !existsAfter(/databases/$(database)/documents/favorites/$(myUid() + '_' + propertyId))
+            )
+          )
+        );
+
+      allow delete: if isAdmin() || (isLandlordOrAgent() && resource.data.landlordId == myUid());
+    }
+
+    // ---------- tenancies ----------
+    match /tenancies/{tenancyId} {
+      allow get: if isAdmin()
+        || (isSignedIn() && (resource.data.tenantId == myUid() || resource.data.landlordId == myUid()));
+
+      allow list: if isAdmin()
+        || (isTenantRole() && resource.data.tenantId == myUid())
+        || (isLandlordOrAgent() && resource.data.landlordId == myUid());
+
+      allow create: if isAdmin() || (
+        isLandlordOrAgent()
+        && request.resource.data.landlordId == myUid()
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.landlordId == myUid()
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.status in ['approved', 'vacant', 'rented']
+        && request.resource.data.status in ['pending', 'active']
+        && get(/databases/$(database)/documents/users/$(request.resource.data.tenantId)).data.role == 'tenant'
+        && request.resource.data.keys().hasOnly([
+          'tenantId', 'propertyId', 'landlordId', 'startDate', 'endDate', 'status',
+          'createdAt', 'updatedAt'
+        ])
+      );
+
+      allow update: if isAdmin()
+        || (
+          isLandlordOrAgent()
+          && resource.data.landlordId == myUid()
+          && request.resource.data.tenantId == resource.data.tenantId
+          && request.resource.data.propertyId == resource.data.propertyId
+          && request.resource.data.landlordId == resource.data.landlordId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'endDate', 'updatedAt'
+          ])
+        );
+
+      allow delete: if isAdmin();
+    }
+
+    // ---------- viewingRequests ----------
+    match /viewingRequests/{requestId} {
+      allow get: if isAdmin()
+        || (isSignedIn() && (resource.data.tenantId == myUid() || resource.data.landlordId == myUid()));
+
+      allow list: if isAdmin()
+        || (isTenantRole() && resource.data.tenantId == myUid())
+        || (isLandlordOrAgent() && resource.data.landlordId == myUid());
+
+      // Create: only a tenant, only for themselves, only for an APPROVED property that
+      // they don't own, with the landlordId taken from that property, an allowed
+      // date/time slot and no extra fields.
+      //  * The document id is bound to the payload:
+      //      {tenantUid}_{propertyId}_{yyyy-MM-dd}_{HHmm}  (+ optional _N retry suffix)
+      //  * The request must be written in the same batch as its viewingLocks document
+      //    (one per tenant+property), which is what limits a tenant to ONE active request
+      //    per property even if the client is modified.
+      allow create: if isTenantRole() && isNotSuspended()
+        && request.resource.data.keys().hasOnly([
+          'propertyId', 'tenantId', 'landlordId', 'requestedDate', 'requestedTime',
+          'message', 'propertyTitle', 'tenantName', 'status', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.keys().hasAll([
+          'propertyId', 'tenantId', 'landlordId', 'requestedDate', 'requestedTime',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.tenantId == myUid()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.propertyId is string
+        && request.resource.data.requestedDate is string
+        && request.resource.data.requestedDate.matches('[0-9]{4}-[0-9]{2}-[0-9]{2}')
+        // Tenants pick their own time: strict 24h HH:mm inside the allowed window
+        // (VIEWING_EARLIEST_TIME / VIEWING_LATEST_TIME in src/constants/viewing.ts).
+        && request.resource.data.requestedTime is string
+        && request.resource.data.requestedTime.matches('([01][0-9]|2[0-3]):[0-5][0-9]')
+        && request.resource.data.requestedTime >= '06:00'
+        && request.resource.data.requestedTime <= '20:00'
+        && requestId.matches(
+             myUid() + '_' + request.resource.data.propertyId + '_'
+             + request.resource.data.requestedDate + '_'
+             + request.resource.data.requestedTime.replace(':', '') + '(_[0-9]{1,2})?')
+        && (!('message' in request.resource.data)
+            || (request.resource.data.message is string && request.resource.data.message.size() <= 500))
+        && (!('propertyTitle' in request.resource.data)
+            || (request.resource.data.propertyTitle is string && request.resource.data.propertyTitle.size() <= 120))
+        && (!('tenantName' in request.resource.data)
+            || (request.resource.data.tenantName is string && request.resource.data.tenantName.size() <= 80))
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && get(docPath('properties', request.resource.data.propertyId)).data.status in ['approved', 'vacant']
+        && get(docPath('properties', request.resource.data.propertyId)).data.landlordId == request.resource.data.landlordId
+        && request.resource.data.landlordId != myUid()
+        && !exists(viewingLockPath(myUid(), request.resource.data.propertyId))
+        && existsAfter(viewingLockPath(myUid(), request.resource.data.propertyId))
+        && getAfter(viewingLockPath(myUid(), request.resource.data.propertyId)).data.requestId == requestId;
+
+      // State machine (mirrors src/services/viewingRequests.logic.ts):
+      //   tenant:   pending  -> cancelled,  accepted -> cancelled
+      //   landlord: pending  -> accepted | declined,  accepted -> completed | cancelled
+      // Only `status` and `updatedAt` may change; ownership fields are immutable.
+      // A move to a terminal status must release the tenant+property lock in the same
+      // write, otherwise the tenant could never request that property again.
+      allow update: if isAdmin()
+        || (
+          isLandlordOrAgent() && isNotSuspended()
+          && resource.data.landlordId == myUid()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && (
+            (resource.data.status == 'pending' && request.resource.data.status in ['accepted', 'declined'])
+            || (resource.data.status == 'accepted' && request.resource.data.status in ['completed', 'cancelled'])
+          )
+          && (!(request.resource.data.status in ['declined', 'cancelled', 'completed'])
+              || !existsAfter(viewingLockPath(resource.data.tenantId, resource.data.propertyId)))
+        )
+        || (
+          isTenantRole() && isNotSuspended()
+          && resource.data.tenantId == myUid()
+          && resource.data.status in ['pending', 'accepted']
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.status == 'cancelled'
+          && !existsAfter(viewingLockPath(myUid(), resource.data.propertyId))
+        );
+
+      allow delete: if false;
+    }
+
+    // ---------- viewingLocks ----------
+    // Server-side guarantee of "one active viewing request per tenant per property".
+    // Created together with the request, deleted together with the request reaching a
+    // terminal status. `resource == null` lets the client test for a lock's existence.
+    match /viewingLocks/{lockId} {
+      allow get: if isSignedIn()
+        && (resource == null
+            || resource.data.tenantId == myUid()
+            || resource.data.landlordId == myUid()
+            || isAdmin());
+      allow list: if false;
+
+      allow create: if isTenantRole() && isNotSuspended()
+        && request.resource.data.keys().hasOnly(['tenantId', 'landlordId', 'propertyId', 'requestId', 'createdAt'])
+        && request.resource.data.tenantId == myUid()
+        && request.resource.data.propertyId is string
+        && request.resource.data.requestId is string
+        && lockId == myUid() + '_' + request.resource.data.propertyId
+        && request.resource.data.createdAt == request.time
+        && existsAfter(docPath('viewingRequests', request.resource.data.requestId))
+        && getAfter(docPath('viewingRequests', request.resource.data.requestId)).data.status == 'pending'
+        && getAfter(docPath('viewingRequests', request.resource.data.requestId)).data.tenantId == myUid()
+        && getAfter(docPath('viewingRequests', request.resource.data.requestId)).data.propertyId == request.resource.data.propertyId
+        && getAfter(docPath('viewingRequests', request.resource.data.requestId)).data.landlordId == request.resource.data.landlordId;
+
+      allow update: if false;
+
+      allow delete: if isSignedIn()
+        && (resource.data.tenantId == myUid() || resource.data.landlordId == myUid() || isAdmin())
+        && getAfter(docPath('viewingRequests', resource.data.requestId)).data.status
+             in ['declined', 'cancelled', 'completed'];
+    }
+
+    // ---------- maintenanceRequests ----------
+    match /maintenanceRequests/{requestId} {
+      allow get: if isAdmin()
+        || (isSignedIn() && (resource.data.tenantId == myUid() || resource.data.landlordId == myUid()));
+
+      allow list: if isAdmin()
+        || (isTenantRole() && resource.data.tenantId == myUid())
+        || (isLandlordOrAgent() && resource.data.landlordId == myUid());
+
+      // Maintenance requires an active tenancy and the property/landlord must
+      // match that tenancy. The client cannot manufacture an unrelated request.
+      allow create: if isTenantRole() && isNotSuspended()
+        && request.resource.data.tenantId == myUid()
+        && request.resource.data.status == 'submitted'
+        && request.resource.data.photos is list
+        && get(/databases/$(database)/documents/tenancies/$(request.resource.data.tenancyId)).data.tenantId == myUid()
+        && get(/databases/$(database)/documents/tenancies/$(request.resource.data.tenancyId)).data.status == 'active'
+        && get(/databases/$(database)/documents/tenancies/$(request.resource.data.tenancyId)).data.propertyId == request.resource.data.propertyId
+        && get(/databases/$(database)/documents/tenancies/$(request.resource.data.tenancyId)).data.landlordId == request.resource.data.landlordId;
+
+      // Landlord/agent updates are limited to workflow/assignment/cost fields.
+      allow update: if isAdmin()
+        || (
+          isLandlordOrAgent()
+          && resource.data.landlordId == myUid()
+          && request.resource.data.tenantId == resource.data.tenantId
+          && request.resource.data.propertyId == resource.data.propertyId
+          && request.resource.data.tenancyId == resource.data.tenancyId
+          && request.resource.data.landlordId == resource.data.landlordId
+          && request.resource.data.referenceNumber == resource.data.referenceNumber
+          && request.resource.data.createdAt == resource.data.createdAt
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'assignment', 'scheduledAt', 'estimatedCost', 'actualCost',
+            'currency', 'invoiceReference', 'costVisibleToTenant', 'completedAt',
+            'updatedAt'
+          ])
+        )
+        // Tenant attachment patch: the initial create intentionally starts with
+        // empty photos, then the client uploads files and patches only those
+        // attachment fields while the request is still submitted.
+        || (
+          isTenantRole()
+          && resource.data.tenantId == myUid()
+          && resource.data.status == 'submitted'
+          && resource.data.photos.size() == 0
+          && request.resource.data.status == resource.data.status
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'photos', 'videoUrl', 'updatedAt'
+          ])
+        )
+        // Tenant may cancel an open request without changing financial fields
+        // or ownership/identity fields.
+        || (
+          isTenantRole()
+          && resource.data.tenantId == myUid()
+          && resource.data.status in ['submitted', 'under_review']
+          && request.resource.data.status == 'cancelled'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+        );
+
+      allow delete: if false;
+
+      match /timeline/{eventId} {
+        allow get, list: if isAdmin()
+          || (
+            isSignedIn()
+            && (
+              get(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data.tenantId == myUid()
+              || get(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data.landlordId == myUid()
+            )
+          );
+
+        allow create: if isAdmin()
+          || (
+            isSignedIn()
+            && request.resource.data.actorId == myUid()
+            && (
+              (
+                get(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data.tenantId == myUid()
+                && request.resource.data.status == 'submitted'
+              )
+              || (
+                isLandlordOrAgent()
+                && get(/databases/$(database)/documents/maintenanceRequests/$(requestId)).data.landlordId == myUid()
+              )
+            )
+          );
+
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- maintenanceMessages ----------
+    match /maintenanceMessages/{messageId} {
+      function parentRequest() {
+        return get(/databases/$(database)/documents/maintenanceRequests/$(resource.data.maintenanceRequestId)).data;
+      }
+      function parentRequestOnCreate() {
+        return get(/databases/$(database)/documents/maintenanceRequests/$(request.resource.data.maintenanceRequestId)).data;
+      }
+
+      allow get: if isAdmin()
+        || (isSignedIn() && (parentRequest().tenantId == myUid() || parentRequest().landlordId == myUid()));
+
+      allow list: if isAdmin()
+        || (
+          isSignedIn()
+          && (
+            parentRequest().tenantId == myUid()
+            || parentRequest().landlordId == myUid()
+          )
+        );
+
+      allow create: if isSignedIn()
+        && request.resource.data.senderId == myUid()
+        && (
+          parentRequestOnCreate().tenantId == myUid()
+          || parentRequestOnCreate().landlordId == myUid()
+        );
+
+      allow update, delete: if false;
+    }
+
+    // ---------- maintenanceAssignments ----------
+    match /maintenanceAssignments/{assignmentId} {
+      function parentRequest() {
+        return get(/databases/$(database)/documents/maintenanceRequests/$(resource.data.maintenanceRequestId)).data;
+      }
+      function parentRequestOnCreate() {
+        return get(/databases/$(database)/documents/maintenanceRequests/$(request.resource.data.maintenanceRequestId)).data;
+      }
+
+      allow get: if isAdmin()
+        || (isSignedIn() && (parentRequest().tenantId == myUid() || parentRequest().landlordId == myUid()));
+
+      allow list: if isAdmin()
+        || (
+          isSignedIn()
+          && (
+            parentRequest().tenantId == myUid()
+            || parentRequest().landlordId == myUid()
+          )
+        );
+
+      allow create: if isLandlordOrAgent()
+        && request.resource.data.assignedBy == myUid()
+        && parentRequestOnCreate().landlordId == myUid();
+
+      allow update, delete: if false;
+    }
+
+    // ---------- conversations & messages ----------
+    // Enquiry threads are created by the TENANT, for an approved property, with
+    // exactly [tenantUid, propertyOwnerUid] as participants and the deterministic id
+    // `enquiry_{propertyId}_{tenantUid}_{landlordUid}`. Later writes (either party
+    // replying) may only bump the last-message preview.
+    match /conversations/{conversationId} {
+      allow get: if isAdmin() || (isSignedIn() && myUid() in resource.data.participantIds);
+      allow list: if isAdmin() || (isSignedIn() && myUid() in resource.data.participantIds);
+      allow create: if isSignedIn()
+        && request.resource.data.participantIds is list
+        && request.resource.data.participantIds.size() == 2
+        && request.resource.data.participantIds[0] == myUid()
+        && request.resource.data.context == 'property_enquiry'
+        && conversationId == 'enquiry_' + request.resource.data.propertyId + '_'
+             + request.resource.data.participantIds[0] + '_' + request.resource.data.participantIds[1]
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.landlordId
+             == request.resource.data.participantIds[1]
+        && get(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)).data.status in ['approved', 'vacant']
+        && request.resource.data.keys().hasOnly([
+          'context', 'propertyId', 'participantIds', 'lastMessage', 'lastMessageAt', 'createdAt', 'tenantName'
+        ])
+        && (!('tenantName' in request.resource.data)
+            || (request.resource.data.tenantName is string
+                && request.resource.data.tenantName.size() <= 80))
+        && request.resource.data.lastMessage is string
+        && request.resource.data.lastMessage.size() <= 200;
+      allow update: if isAdmin() || (
+        isSignedIn()
+        && myUid() in resource.data.participantIds
+        && request.resource.data.participantIds == resource.data.participantIds
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastMessageAt', 'tenantName'])
+        // Only the tenant (participantIds[0]) may set/refresh the tenant's display name.
+        && (!('tenantName' in request.resource.data.diff(resource.data).affectedKeys())
+            || (resource.data.participantIds[0] == myUid()
+                && request.resource.data.tenantName is string
+                && request.resource.data.tenantName.size() <= 80))
+        && request.resource.data.lastMessage is string
+        && request.resource.data.lastMessage.size() <= 200
+      );
+      allow delete: if false;
+    }
+
+    match /messages/{messageId} {
+      function parentConversation() {
+        return get(/databases/$(database)/documents/conversations/$(resource.data.conversationId)).data;
+      }
+      function parentConversationOnCreate() {
+        return get(/databases/$(database)/documents/conversations/$(request.resource.data.conversationId)).data;
+      }
+
+      allow get: if isAdmin() || (isSignedIn() && myUid() in parentConversation().participantIds);
+      allow list: if isAdmin() || (isSignedIn() && myUid() in parentConversation().participantIds);
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['conversationId', 'senderId', 'text', 'readBy', 'createdAt'])
+        && request.resource.data.senderId == myUid()
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000
+        && myUid() in parentConversationOnCreate().participantIds;
+      allow update, delete: if false;
+    }
+
+    // ---------- favorites ----------
+    match /favorites/{favoriteId} {
+      allow get, list: if isSignedIn() && resource.data.userId == myUid();
+      allow create: if isSignedIn() && isNotSuspended()
+        && request.resource.data.userId == myUid()
+        && request.resource.data.propertyId is string
+        && favoriteId == myUid() + '_' + request.resource.data.propertyId
+        && request.resource.data.keys().hasOnly(['userId', 'propertyId', 'createdAt']);
+      allow delete: if isSignedIn() && resource.data.userId == myUid();
+      allow update: if false;
+    }
+
+    // ---------- notifications ----------
+    // Client-created notifications are still an MVP shortcut (a Cloud Function trigger is the
+    // proper fix), but creation is now constrained: the type must be a known one, and the
+    // sender must genuinely share the referenced viewing request / maintenance request with
+    // the recipient (or be an admin). Nobody can push arbitrary text to arbitrary users.
+    function notifRef() {
+      return request.resource.data.data;
+    }
+    function viewingPairOk() {
+      return notifRef() is map && 'viewingRequestId' in notifRef()
+        && notifRef().viewingRequestId is string
+        && (
+          (get(docPath('viewingRequests', notifRef().viewingRequestId)).data.tenantId == myUid()
+            && get(docPath('viewingRequests', notifRef().viewingRequestId)).data.landlordId == request.resource.data.userId)
+          || (get(docPath('viewingRequests', notifRef().viewingRequestId)).data.landlordId == myUid()
+            && get(docPath('viewingRequests', notifRef().viewingRequestId)).data.tenantId == request.resource.data.userId)
+        );
+    }
+    function maintenancePairOk() {
+      return notifRef() is map && 'maintenanceRequestId' in notifRef()
+        && notifRef().maintenanceRequestId is string
+        && (
+          (get(docPath('maintenanceRequests', notifRef().maintenanceRequestId)).data.tenantId == myUid()
+            && get(docPath('maintenanceRequests', notifRef().maintenanceRequestId)).data.landlordId == request.resource.data.userId)
+          || (get(docPath('maintenanceRequests', notifRef().maintenanceRequestId)).data.landlordId == myUid()
+            && get(docPath('maintenanceRequests', notifRef().maintenanceRequestId)).data.tenantId == request.resource.data.userId)
+        );
+    }
+
+    match /notifications/{notificationId} {
+      allow get, list: if isAdmin() || (isSignedIn() && resource.data.userId == myUid());
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly(['userId', 'type', 'title', 'body', 'data', 'isRead', 'createdAt'])
+        && request.resource.data.userId is string
+        && request.resource.data.userId != myUid()
+        && request.resource.data.isRead == false
+        && request.resource.data.title is string && request.resource.data.title.size() <= 120
+        && request.resource.data.body is string && request.resource.data.body.size() <= 300
+        && request.resource.data.createdAt == request.time
+        && (
+          isAdmin()
+          || (
+            request.resource.data.type in [
+              'new_viewing_request', 'viewing_accepted', 'viewing_declined',
+              'viewing_cancelled', 'viewing_completed'
+            ]
+            && viewingPairOk()
+          )
+          || (
+            request.resource.data.type in [
+              'new_maintenance_request', 'maintenance_received', 'maintenance_updated',
+              'technician_assigned', 'maintenance_scheduled', 'maintenance_completed',
+              'tenant_replied', 'urgency_changed'
+            ]
+            && maintenancePairOk()
+          )
+        );
+      allow update: if isAdmin() || (
+        isSignedIn()
+        && resource.data.userId == myUid()
+        && request.resource.data.userId == resource.data.userId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead'])
+      );
+      allow delete: if isAdmin() || (isSignedIn() && resource.data.userId == myUid());
+    }
+
+    // ---------- reports ----------
+    match /reports/{reportId} {
+      allow get: if isAdmin() || (isSignedIn() && resource.data.reporterId == myUid());
+      allow list: if isAdmin();
+      allow create: if isSignedIn()
+        && request.resource.data.reporterId == myUid()
+        && request.resource.data.status == 'open'
+        && request.resource.data.keys().hasOnly([
+          'reporterId', 'targetType', 'targetId', 'reason', 'details', 'status', 'createdAt'
+        ])
+        && request.resource.data.targetId is string
+        && request.resource.data.reason is string && request.resource.data.reason.size() <= 200
+        && (!('details' in request.resource.data)
+            || (request.resource.data.details is string && request.resource.data.details.size() <= 1000))
+        && request.resource.data.createdAt == request.time;
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ---------- counters ----------
+    // Maintenance reference numbers are generated by an atomic client
+    // transaction. The counter can only be incremented by a tenant and only
+    // by exactly one; arbitrary overwrites are rejected.
+    match /counters/{counterId} {
+      allow get: if isTenantRole();
+      allow create: if isTenantRole()
+        && counterId.matches('maintenance_[0-9]+')
+        && request.resource.data.value == 1;
+      allow update: if isTenantRole()
+        && counterId.matches('maintenance_[0-9]+')
+        && request.resource.data.value == resource.data.value + 1
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['value']);
+      allow delete: if false;
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

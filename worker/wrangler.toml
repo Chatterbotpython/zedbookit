@@ -1,0 +1,26 @@
+# ZedBookIt R2 upload signer.
+#
+# Non-secret configuration lives in [vars]. Secrets are NEVER put in this file;
+# set them with `wrangler secret put` (see README.md in this folder).
+
+name = "zedbookit-r2-upload"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[vars]
+# Firebase project whose ID tokens are accepted (same value as
+# EXPO_PUBLIC_FIREBASE_PROJECT_ID in the app).
+FIREBASE_PROJECT_ID = "zedbookit"
+
+# Fill these in from the Cloudflare dashboard. Left empty on purpose: the Worker
+# refuses to sign anything until they are set.
+R2_ACCOUNT_ID = "cc92e30c4680fa63bcf85954ce98540f"
+R2_BUCKET = "zedbookit-media"
+
+# Optional, comma-separated browser origins allowed to call this Worker
+# (only needed for Expo Web). Native apps do not send an Origin header.
+ALLOWED_ORIGINS = ""
+
+# Required secrets (set via `wrangler secret put`, not here):
+#   R2_ACCESS_KEY_ID
+#   R2_SECRET_ACCESS_KEY
